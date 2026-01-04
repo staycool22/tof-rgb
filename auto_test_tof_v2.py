@@ -35,7 +35,7 @@ def decode_frame(frame_bytes, width, height):
     # 使用 numpy 进行高效解码
     raw = np.frombuffer(frame_bytes, dtype=">u2")  # 大端序读取
     words = raw.byteswap().astype(np.uint16)       # 转换为本地小端序
-    
+
     # 重塑为 (height, 3, width)，其中每行包含 A, B, C 三个通道的数据
     rows = words.reshape(height, 3, width)
     A = rows[:, 0, :]
@@ -43,8 +43,6 @@ def decode_frame(frame_bytes, width, height):
     C = rows[:, 2, :]
 
     # 原始数值解码逻辑:
-    # 标准协议通常是 ((A | ((B >> 12) & 0x000F)) >> 2)
-    # 恢复右移 2 位操作，使其符合标准协议。
     raw_code = ((A | ((B >> 12) & 0x000F)) >> 2).astype(np.uint16)
     
     # 红外数据提取
@@ -71,7 +69,7 @@ class ToFCamera:
         self.current_exposure = 0 # 默认曝光值
         
         # 深度标定参数 (线性变换: Depth = Raw * Scale + Offset)
-        self.depth_scale = 16.76  # 4.19 * 4
+        self.depth_scale = 16.76  
         self.depth_offset = 8.57
 
         # 强度校正参数 (用于修正高反/低反物体的距离偏差)
@@ -85,7 +83,7 @@ class ToFCamera:
         根据目标距离推荐最佳曝光和标定参数。
         """
         # 全局统一使用稳健线性参数
-        common_scale = 16.76 # 4.19 * 4
+        common_scale = 16.76 
         common_offset = 8.57
         
         # 曝光策略: 保持 IR 强度在适中范围 (20-150)
@@ -380,6 +378,7 @@ class TestSuite:
             print("7. 深度分辨力测试 (Depth Resolution)")
             print("8. 空间分辨力测试 (Spatial Resolution)")
             print("9. 强度补偿校准 (Intensity Correction)")
+            print("10. 拍摄 Depth/IR 图像 (Capture Images)")
             print("0. 退出 (Exit)")
             
             choice = input("请输入选项: ")
@@ -402,6 +401,8 @@ class TestSuite:
                 self.test_spatial_resolution()
             elif choice == '9':
                 self.test_calib_intensity_correction()
+            elif choice == '10':
+                self.capture_images_interactive()
             elif choice == '0' or choice == 'q':
                 break
             else:
@@ -648,7 +649,109 @@ class TestSuite:
         self.save_result("Planarity", {"rmse": rmse})
 
     def test_depth_resolution(self):
-        print("\n[深度分辨力] 1.近处目标 2.远处目标")
+        print("\n[深度分辨力测试]")
+        print("1. 标准两点测试 (Standard 2-Point)")
+        print("2. 阶梯测试 (Ladder Test)")
+        choice = input("请选择模式 (1/2): ")
+
+        if choice == '2':
+            self._test_ladder()
+        else:
+            self._test_standard_depth_resolution()
+
+    def _test_ladder(self):
+        try:
+            step_height = float(input("请输入阶梯设计高度 (mm, 默认 10.0): ") or 10.0)
+            print("请输入 ROI 列表 (可直接粘贴 detect_ladder_rois.py 的输出):")
+            print("格式: rois = [(x,y,w,h), ...]")
+            print("输入完成后，请 **按两次回车** (出现空行) 即可结束输入。")
+            
+            lines = []
+            while True:
+                try:
+                    line = input()
+                    # 如果输入的是空行（或只包含空格），则结束
+                    if not line.strip(): 
+                        # 如果还没输入任何内容就回车，说明想用默认参数，直接 break
+                        # 如果已经输了一部分，说明输入结束
+                        break
+                    lines.append(line)
+                except EOFError:
+                    break
+            
+            roi_code = "\n".join(lines)
+            if "rois =" in roi_code:
+                # 极其危险但方便的操作：执行输入的代码提取 rois 变量
+                # 仅限内部测试使用
+                local_scope = {}
+                exec(roi_code, {}, local_scope)
+                rois = local_scope.get('rois', [])
+            else:
+                print("使用默认 7 阶参数...")
+                rois = [
+                    (217, 103, 6, 28), (208, 104, 6, 28), (200, 105, 6, 28),
+                    (194, 105, 6, 28), (186, 104, 6, 28), (179, 104, 6, 28),
+                    (172, 105, 6, 28)
+                ]
+        except Exception as e:
+            print(f"输入解析错误: {e}")
+            return
+
+        print(f"\n[阶梯测试] 阶数: {len(rois)}, 设计高度: {step_height}mm")
+        
+        # 按 X 坐标排序
+        rois.sort(key=lambda r: r[0], reverse=True) 
+
+        if not self.wait_for_key("对准阶梯目标，按 Space 开始采集..."): return
+
+        # 采集数据
+        stack, ir_stack, raw_stack = self.capture_stack(100)
+        
+        results = []
+        print("\n--- 测量结果 ---")
+        
+        # 1. 计算每个台阶的深度
+        for i, roi in enumerate(rois):
+            stats = self.analyzer.calculate_roi_stats(stack, ir_stack, roi, raw_stack=raw_stack)
+            if stats:
+                stats['roi'] = roi
+                results.append(stats)
+            else:
+                print(f"ROI {roi} 数据无效")
+
+        # 2. 按深度均值排序 (从小到大: 近 -> 远)
+        results.sort(key=lambda x: x['mean'])
+
+        # 3. 输出并验证间隔
+        print(f"{'Step':<5} | {'Depth(mm)':<10} | {'Std(mm)':<8} | {'Diff(mm)':<10} | {'Check'}")
+        print("-" * 65)
+
+        for i, res in enumerate(results):
+            depth = res['mean']
+            std = res['std']
+            
+            diff_str = "-"
+            check_str = "-"
+            
+            if i > 0:
+                prev_depth = results[i-1]['mean']
+                diff = depth - prev_depth
+                diff_str = f"{diff:.2f}"
+                
+                # 检查是否接近设计高度 (容差 +/- 20%)
+                tolerance = step_height * 0.2
+                if abs(diff - step_height) <= tolerance:
+                    check_str = "PASS"
+                else:
+                    check_str = "FAIL"
+
+            print(f"{i+1:<5} | {depth:<10.2f} | {std:<8.2f} | {diff_str:<10} | {check_str}")
+            
+            # 保存结果
+            self.save_result(f"Ladder-Step-{i+1}", res, f"Diff={diff_str}")
+
+    def _test_standard_depth_resolution(self):
+        print("\n[标准两点测试] 1.近处目标 2.远处目标")
         if not self.select_roi_interactive(): return
         print("采集 ROI 1 (近)...")
         s1, _, _ = self.capture_stack(50)
@@ -734,6 +837,96 @@ class TestSuite:
             elif key == ord(']'): self.camera.depth_scale += 0.05
             elif key == ord('o'): self.camera.depth_offset -= 10
             elif key == ord('p'): self.camera.depth_offset += 10
+        cv2.destroyAllWindows()
+
+    def robust_normalize(self, img):
+        """鲁棒归一化：忽略极值噪点，使用 99% 分位数作为上限。"""
+        if img is None: return None
+        # 计算 1% 和 99% 分位数，避免坏点影响
+        vmin, vmax = np.percentile(img, [1, 99])
+        # 防止 vmin == vmax 导致除零
+        if vmax <= vmin: 
+            vmax = np.max(img)
+            vmin = np.min(img)
+        
+        # 归一化并截断
+        norm = (img.astype(np.float32) - vmin) / (vmax - vmin + 1e-5) * 255.0
+        return np.clip(norm, 0, 255).astype(np.uint8)
+
+    def capture_images_interactive(self):
+        print("\n[图像拍摄模式]")
+        print("操作: Space/S=拍照, Q=退出, H=切换HDR, +/-=调整曝光")
+        
+        while True:
+            d, i, raw_d = self.camera.get_frame()
+            if d is None:
+                if cv2.waitKey(10) & 0xFF == ord('q'): break
+                continue
+            
+            # Depth 显示 (鲁棒归一化)
+            d_norm = self.robust_normalize(d)
+            d_display = cv2.cvtColor(d_norm, cv2.COLOR_GRAY2BGR)
+            
+            # IR 显示 (鲁棒归一化)
+            if i is not None:
+                i_norm = self.robust_normalize(i)
+                i_display = cv2.cvtColor(i_norm, cv2.COLOR_GRAY2BGR)
+                
+                # 简单的拼接显示：左 Depth，右 IR
+                # 确保高度一致 (通常是一样的)
+                combined = np.hstack((d_display, i_display))
+                cv2.putText(combined, "Left: Depth, Right: IR", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                combined = d_display
+                cv2.putText(combined, "Depth Only", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+            cv2.imshow("Capture Mode", combined)
+            
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s') or key == 32: # Space or s
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                
+                # 保存 Depth 可视化 (灰度)
+                cv2.imwrite(f"capture_{ts}_depth_vis.png", d_norm)
+                
+                # 保存真正的 Raw Code (未标定)
+                if raw_d is not None:
+                    cv2.imwrite(f"capture_{ts}_depth_raw_code.png", raw_d)
+
+                if i is not None:
+                    # i_norm 已经是使用 robust_normalize 计算过的了，直接保存
+                    # 保存 IR 可视化 (灰度)
+                    cv2.imwrite(f"capture_{ts}_ir_vis.png", i_norm)
+                    # 保存 IR Raw (16bit)
+                    cv2.imwrite(f"capture_{ts}_ir_raw.png", i)
+                    
+                print(f"已保存图像组: capture_{ts}_*")
+                
+                # 打印统计信息，让用户确认图像不为空
+                if raw_d is not None:
+                     print(f"  Raw Code Stats:   Min={np.min(raw_d)}, Max={np.max(raw_d)}, Mean={np.mean(raw_d):.1f}")
+                if i is not None:
+                    max_val = np.max(i)
+                    max_idx = np.argmax(i)
+                    y_loc, x_loc = np.unravel_index(max_idx, i.shape)
+                    print(f"  IR Raw Stats:     Min={np.min(i)}, Max={max_val} @ ({y_loc}, {x_loc}), Mean={np.mean(i):.1f}")
+                print("  (注意: Raw Code 是未标定的原始数据，数值非常小，图像全黑是正常的)")
+                
+                # 视觉反馈
+                feedback_img = combined.copy()
+                cv2.putText(feedback_img, "SAVED!", (combined.shape[1]//2 - 60, combined.shape[0]//2), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 0, 255), 3)
+                cv2.imshow("Capture Mode", feedback_img)
+                cv2.waitKey(300) # 暂停 0.3 秒显示 Saved
+                
+            elif key == ord('h'):
+                self.camera.toggle_hdr()
+            elif key == ord('+') or key == ord('='):
+                self.camera.set_exposure(self.camera.current_exposure + 1)
+            elif key == ord('-') or key == ord('_'):
+                self.camera.set_exposure(self.camera.current_exposure - 1)
+                
         cv2.destroyAllWindows()
 
 if __name__ == "__main__":
